@@ -42,7 +42,7 @@ The `fork_worker` option allows your application to be initialized only once for
 
 ### PR_SET_CHILD_SUBREAPER
 
-Where available from the OS (Linux 3.4+), if you are using `fork_worker` Puma will mark the cluster parent automatically as a "child subreaper", so that in case worker-0 terminates, its child processes end up reparented to the cluster parent rather than orphaned.
+Where available from the OS (Linux 3.4+), if you are using `fork_worker` or `mold_worker` Puma will mark the cluster parent automatically as a "child subreaper", so that if worker 0 or a mold exits, its child processes are reparented to the cluster parent instead of to init.
 
 ### Mold-Worker Cluster Mode [Experimental] [Alternative]
 
@@ -50,15 +50,19 @@ Where available from the OS (Linux 3.4+), if you are using `fork_worker` Puma wi
 
 ### Mold-Worker Important Differences
 
-- `mold_worker` is capable of triggering a forced refork at multiple thresholds; by default it will trigger one mold promotion and a phased refork the first time any worker passes 1000 requests, but you can pass 1..n thresholds instead and it will trigger a refork as soon as a worker passes those request counts in order. E.g. with `mold_worker(400, 800, 1600)`, the first time a worker makes it to 400 requests, it will be promoted to mold, replaced with a new refork, and then all other workers will be replaced with reforks as well; once one of these makes it to 800 total requests, that worker will be promoted to mold, the old mold will be terminated, and the refork process runs again, until there are no more thresholds. After this point there are no more forced promotions or reforks, they will only occur as worker processes are terminated by external causes (molds can also be terminated, but promotion of a new mold will not take place until a refork is required).
-- SIGURG will terminate any existing mold, promote the worker with the highest request count to mold, and trigger a full refork from that mold
-- SIGUSR1 will terminate any existing mold as well as any workers, reset the threshold series provided in config, and fork all new workers from the cluster parent
-- `mold_worker` will also fork workers directly from the cluster parent at initial boot, as a mold adds no value at this point
-- Mold processes will _not_ become more efficient over time as they have stopped taking traffic; to see additional benefits, add an additional refork threshold at the end of your config to promote a new more complete mold, or use SIGURG to promote whatever worker has the highest request count to mold and replace all the other workers with reforks.
+- `mold_worker` triggers a refork at each of the request thresholds you pass it, in order. The default is one refork at 1000 requests. Workers forked from a mold start counting requests from zero, so each threshold is the number of requests that one worker of the current generation must serve. For example, with `mold_worker 400, 800, 1600`:
+  1. When a worker has served 400 requests, it is promoted to mold and stops serving requests. Puma forks a replacement from the mold, then replaces the other workers one at a time with forks of the mold.
+  2. When one of those workers has served 800 requests, it is promoted to be the new mold, the previous mold exits, and all workers are replaced again.
+  3. The same happens at 1600 requests. After the last threshold, Puma only forks from the mold to replace workers that exit.
+- During a refork, the new mold is promoted first, and Puma stops an old worker only after the previous replacement has booted. At most one worker is unavailable at a time, which is one fewer than a `fork_worker` refork.
+- SIGURG, or `pumactl refork`, promotes the worker with the highest request count to mold and replaces all workers with forks of it.
+- SIGUSR1, or `pumactl phased-restart`, stops the current mold and replaces each worker with a fresh fork of the cluster parent, so that the workers load new application code. Like any phased restart, this requires `preload_app! false`. After the restart, the thresholds start again from the first one.
+- Puma forks workers directly from the cluster parent at boot. If a worker exits before any mold exists, the worker with the highest request count is promoted to mold and the replacement is forked from it.
+- A mold does not serve requests, so it does not warm up further. To fork from a more warmed-up process later, add another threshold or send SIGURG.
 
 ### Mold-Worker Migration Guide (From Fork-Worker)
 
-- Any logic in your `on_refork` hook that shuts down worker resources should move to the `on_mold_promotion` hook; any other logic should either be discarded or refactored to run in a `on_worker_boot` hook
-- All logic in your `after_refork` hook should be discarded.
-- Any logic in `on_worker_shutdown` that has to do with finishing serving requests should be duplicated to `on_mold_promotion`; anything having to do with process termination should be duplicated to `on_mold_shutdown`
+- Move logic in your `before_refork` hook that shuts down worker resources to the `on_mold_promotion` hook. Remove any other logic, or move it to a `before_worker_boot` hook.
+- Remove your `after_refork` hook. Puma does not call it in `mold_worker` mode.
+- A mold does not run `before_worker_shutdown`. Copy logic from that hook that finishes serving requests to `on_mold_promotion`, and logic that runs at process exit to `on_mold_shutdown`.
 - Replace `fork_worker` with `mold_worker` in either your CLI invocation or config file; consider adding extra intervals with some kind of exponential period to increase the efficiency of shared memory and warmed caches.

@@ -1455,9 +1455,18 @@ module Puma
     # This option also enables the `refork` command (SIGURG), which allows external processes to trigger
     # promotion and reforking from a new mold process.
     #
-    # Reforks will trigger automatically as workers hit the specified number of requests (default 1000),
-    # and multiple intervals can be specified (as absolute request count thresholds) to allow for improved
-    # performance over time.
+    # A refork triggers automatically when a worker has served the specified number of requests
+    # (default 1000). Pass several thresholds to refork again later. Workers forked from a mold start
+    # counting requests from zero, so each threshold is the number of requests a worker of the current
+    # generation must serve before the next refork. After the last threshold, no more automatic reforks
+    # happen until the next phased restart, which starts again from the first threshold.
+    #
+    # @note This is experimental.
+    # @note Cluster mode only.
+    #
+    # @example
+    #   mold_worker 400, 800, 1600
+    #
     def mold_worker(mold_at=1000, *additional_molds)
       return if warn_on_incompatible_option(:fork_worker, :mold_worker)
       @options[:mold_worker] = [Integer(mold_at)] + additional_molds.map { |m| Integer(m) }
@@ -1475,13 +1484,6 @@ module Puma
       process_hook :on_mold_shutdown, key, block, cluster_only: true
     end
 
-    # The number of requests to attempt inline before sending a client back to
-    # the reactor to be subject to normal ordering.
-    #
-    # The default is 10.
-    #
-    # @example
-    #   max_fast_inline 20
     # @deprecated Use {#max_keep_alive} instead.
     #
     def max_fast_inline(num_of_requests)

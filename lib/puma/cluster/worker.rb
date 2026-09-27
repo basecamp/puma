@@ -107,7 +107,10 @@ module Puma
             @mold = true
             restart_server.clear
             restart_server << false
-            @server.begin_restart(true)
+            # Do not wait for the server here; the main thread is already waiting in
+            # server_thread.join, and blocking inside the trap can prevent the
+            # server thread from finishing.
+            @server.begin_restart
           end
         end
 
@@ -127,6 +130,8 @@ module Puma
 
         while restart_server.pop
           server_thread = @server.run
+          # A promotion signal that arrived before the server started had no effect
+          @server.begin_restart if @mold
 
           if @log_writer.debug? && index == 0
             debug_loaded_extensions "Loaded Extensions - worker 0:"
@@ -140,9 +145,12 @@ module Puma
         if @mold
           set_proc_title(role: "mold")
 
+          # Closing @fork_pipe inside the trap raises in the thread reading it, so the
+          # trap writes to a separate pipe that the fork loop also waits on.
+          @mold_stop_read, @mold_stop_write = IO.pipe
           Signal.trap("SIGTERM") do
             @worker_write << "#{PIPE_EXTERNAL_TERM}#{Process.pid}\n" rescue nil
-            @fork_pipe.close
+            @mold_stop_write.write_nonblock(".", exception: false)
           end
 
           worker_pids = []
@@ -157,12 +165,10 @@ module Puma
           make_sure_pinging(@server)
           wakeup!
 
-          begin
-            while (idx = PipeProtocols::Fork.read_from(@fork_pipe))
-              worker_pids << (pid = spawn_worker(idx))
-              @worker_write << "#{PIPE_FORK}#{pid}:#{idx}\n"
-              log "Forked worker #{idx} with pid #{pid}"
-            end
+          while (idx = next_fork_request)
+            worker_pids << (pid = spawn_worker(idx))
+            @worker_write << "#{PIPE_FORK}#{pid}:#{idx}\n" rescue nil
+            debug "Forked worker #{idx} with pid #{pid}"
           end
 
           @config.run_hooks(:on_mold_shutdown, index, @log_writer, @hook_data)
@@ -171,11 +177,26 @@ module Puma
         # exiting until any background operations are completed
         @config.run_hooks(:before_worker_shutdown, index, @log_writer, @hook_data) unless @mold
       ensure
-        @worker_write << "#{PIPE_TERM}#{Process.pid}\n"
+        @worker_write << "#{PIPE_TERM}#{Process.pid}\n" rescue nil
         @worker_write.close
       end
 
       private
+
+      # Returns the index of the next worker to fork, or nil when the mold should stop.
+      def next_fork_request
+        loop do
+          readable, = IO.select([@fork_pipe, @mold_stop_read])
+          return nil if readable.include?(@mold_stop_read)
+
+          # Retired molds can still be reading from the same pipe, so another
+          # process may have consumed the request between select and read.
+          idx = PipeProtocols::Fork.read_nonblock_from(@fork_pipe)
+          return idx unless idx == :wait_readable
+        end
+      rescue IOError
+        nil
+      end
 
       def make_sure_pinging(server)
         # if the stat thread died, join and replace it
@@ -228,6 +249,8 @@ module Puma
         end
 
         pid = fork do
+          @mold_stop_read&.close
+          @mold_stop_write&.close
           new_worker = Worker.new index: idx,
                                   master: master,
                                   launcher: @launcher,

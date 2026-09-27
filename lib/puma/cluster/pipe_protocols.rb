@@ -10,10 +10,11 @@ module Puma
         PAYLOAD_STRING = "l"
         PAYLOAD_SIZE = 4
 
-        def self.read_from(pipe)
-          pipe.read(PAYLOAD_SIZE, @read_buffer)&.unpack1(PAYLOAD_STRING)
-        rescue IOError
-          nil
+        # Returns the value, :wait_readable when the pipe is empty, or nil at end of file.
+        # Writes of PAYLOAD_SIZE bytes are atomic, so a read never returns part of a value.
+        def self.read_nonblock_from(pipe)
+          result = pipe.read_nonblock(PAYLOAD_SIZE, @read_buffer, exception: false)
+          result.is_a?(String) ? result.unpack1(PAYLOAD_STRING) : result
         ensure
           @read_buffer.clear
         end
