@@ -39,3 +39,26 @@ The `fork_worker` option allows your application to be initialized only once for
 - In order to fork new workers cleanly, worker 0 shuts down its server and stops serving requests so there are no open file descriptors or other kinds of shared global state between processes, and to maximize copy-on-write efficiency across the newly-forked workers. This may temporarily reduce total capacity of the cluster during a phased restart / refork.
 
 - In a cluster with `n` workers, a normal phased restart stops and restarts workers one by one while the application is loaded in each process, so `n-1` workers are available serving requests during the restart. In a phased restart in fork-worker mode, the application is first loaded in worker 0 while `n-1` workers are available, then worker 0 remains stopped while the rest of the workers are reloaded one by one, leaving only `n-2` workers to be available for a brief period of time. Reloading the rest of the workers should be quick because the application is preloaded at that point, but there may be situations where it can take longer (slow clients, long-running application code, slow worker-fork hooks, etc).
+
+### PR_SET_CHILD_SUBREAPER
+
+Where available from the OS (Linux 3.4+), if you are using `fork_worker` Puma will mark the cluster parent automatically as a "child subreaper", so that in case worker-0 terminates, its child processes end up reparented to the cluster parent rather than orphaned.
+
+### Mold-Worker Cluster Mode [Experimental] [Alternative]
+
+`mold_worker` is similar in concept to `fork_worker` except that before a worker process reforks, it permanently stops handling requests and converts to a "mold" process, effectively an idle worker template. This provides some stability advantages over the standard fork_worker mode, as you no longer have to coordinate reforks with a request server stopping and restarting, and are at much lower risk of losing the reforking process to termination via OOM, timeouts, or other external mechanisms.
+
+### Mold-Worker Important Differences
+
+- `mold_worker` is capable of triggering a forced refork at multiple thresholds; by default it will trigger one mold promotion and a phased refork the first time any worker passes 1000 requests, but you can pass 1..n thresholds instead and it will trigger a refork as soon as a worker passes those request counts in order. E.g. with `mold_worker(400, 800, 1600)`, the first time a worker makes it to 400 requests, it will be promoted to mold, replaced with a new refork, and then all other workers will be replaced with reforks as well; once one of these makes it to 800 total requests, that worker will be promoted to mold, the old mold will be terminated, and the refork process runs again, until there are no more thresholds. After this point there are no more forced promotions or reforks, they will only occur as worker processes are terminated by external causes (molds can also be terminated, but promotion of a new mold will not take place until a refork is required).
+- SIGURG will terminate any existing mold, promote the worker with the highest request count to mold, and trigger a full refork from that mold
+- SIGUSR1 will terminate any existing mold as well as any workers, reset the threshold series provided in config, and fork all new workers from the cluster parent
+- `mold_worker` will also fork workers directly from the cluster parent at initial boot, as a mold adds no value at this point
+- Mold processes will _not_ become more efficient over time as they have stopped taking traffic; to see additional benefits, add an additional refork threshold at the end of your config to promote a new more complete mold, or use SIGURG to promote whatever worker has the highest request count to mold and replace all the other workers with reforks.
+
+### Mold-Worker Migration Guide (From Fork-Worker)
+
+- Any logic in your `on_refork` hook that shuts down worker resources should move to the `on_mold_promotion` hook; any other logic should either be discarded or refactored to run in a `on_worker_boot` hook
+- All logic in your `after_refork` hook should be discarded.
+- Any logic in `on_worker_shutdown` that has to do with finishing serving requests should be duplicated to `on_mold_promotion`; anything having to do with process termination should be duplicated to `on_mold_shutdown`
+- Replace `fork_worker` with `mold_worker` in either your CLI invocation or config file; consider adding extra intervals with some kind of exponential period to increase the efficiency of shared memory and warmed caches.

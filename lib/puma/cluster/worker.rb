@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'pipe_protocols'
+
 module Puma
   class Cluster < Puma::Runner
     #—————————————————————— DO NOT USE — this class is for internal use only ———
@@ -26,12 +28,11 @@ module Puma
         @app = app
         @server = nil
         @hook_data = {}
+        @mold = false
       end
 
       def run
-        title  = "puma: cluster worker #{index}: #{master}"
-        title += " [#{@options[:tag]}]" if @options[:tag] && !@options[:tag].empty?
-        $0 = title
+        set_proc_title
 
         Signal.trap "SIGINT", "IGNORE"
         Signal.trap "SIGCHLD", "DEFAULT"
@@ -94,10 +95,19 @@ module Puma
               elsif idx == 0 # restart server
                 restart_server << true << false
               else # fork worker
-                worker_pids << pid = spawn_worker(idx)
+                worker_pids << (pid = spawn_worker(idx))
                 @worker_write << "#{PIPE_FORK}#{pid}:#{idx}\n" rescue nil
               end
             end
+          end
+        end
+
+        if @options[:mold_worker]
+          Signal.trap("SIGURG") do
+            @mold = true
+            restart_server.clear
+            restart_server << false
+            @server.begin_restart(true)
           end
         end
 
@@ -122,49 +132,106 @@ module Puma
             debug_loaded_extensions "Loaded Extensions - worker 0:"
           end
 
-          stat_thread ||= Thread.new(@worker_write) do |io|
-            Puma.set_thread_name "stat pld"
-            base_payload = "#{PIPE_PING}#{Process.pid}"
+          make_sure_pinging(@server)
 
-            while true
-              begin
-                payload = base_payload.dup
-
-                hsh = @server.stats
-                hsh.each do |k, v|
-                  payload << %Q! "#{k}":#{v || 0},!
-                end
-                # sub call properly adds 'closing' string
-                io << payload.sub(/,\z/, " }\n")
-                @server.reset_max
-              rescue SystemCallError, IOError
-                break
-              end
-              sleep @options[:worker_check_interval]
-            end
-          end
           server_thread.join
         end
 
+        if @mold
+          set_proc_title(role: "mold")
+
+          Signal.trap("SIGTERM") do
+            @worker_write << "#{PIPE_EXTERNAL_TERM}#{Process.pid}\n" rescue nil
+            @fork_pipe.close
+          end
+
+          worker_pids = []
+          Signal.trap "SIGCHLD" do
+            wakeup! if worker_pids.reject! do |p|
+              Process.wait(p, Process::WNOHANG) rescue true
+            end
+          end
+
+          @config.run_hooks(:on_mold_promotion, index, @log_writer, @hook_data)
+
+          make_sure_pinging(@server)
+          wakeup!
+
+          begin
+            while (idx = PipeProtocols::Fork.read_from(@fork_pipe))
+              worker_pids << (pid = spawn_worker(idx))
+              @worker_write << "#{PIPE_FORK}#{pid}:#{idx}\n"
+              log "Forked worker #{idx} with pid #{pid}"
+            end
+          end
+
+          @config.run_hooks(:on_mold_shutdown, index, @log_writer, @hook_data)
+        end
         # Invoke any worker shutdown hooks so they can prevent the worker
         # exiting until any background operations are completed
-        @config.run_hooks(:before_worker_shutdown, index, @log_writer, @hook_data)
+        @config.run_hooks(:before_worker_shutdown, index, @log_writer, @hook_data) unless @mold
       ensure
-        @worker_write << "#{PIPE_TERM}#{Process.pid}\n" rescue nil
+        @worker_write << "#{PIPE_TERM}#{Process.pid}\n"
         @worker_write.close
       end
 
       private
 
+      def make_sure_pinging(server)
+        # if the stat thread died, join and replace it
+        if @stat_thread && !@stat_thread.alive?
+          @stat_thread.join rescue nil # just ignore exceptions here
+          @stat_thread = nil
+        end
+
+        @stat_thread ||= Thread.new(@worker_write) do |io|
+          Puma.set_thread_name "stat pld"
+          base_payload = "#{PIPE_PING}#{Process.pid}"
+
+          while true
+            begin
+              payload = base_payload.dup
+
+              hsh = @server.stats
+              hsh.each do |k, v|
+                payload << %Q! "#{k}":#{v || 0},!
+              end
+              # sub call properly adds 'closing' string
+              io << payload.sub(/,\z/, " }\n")
+              @server.reset_max
+            rescue SystemCallError, IOError
+              break
+            end
+            sleep @options[:worker_check_interval]
+          end
+        end
+
+      end
+
+      def set_proc_title(role: "worker")
+        title  = "puma: #{role} #{index}: #{master}"
+        title += " [#{@options[:tag]}]" if @options[:tag] && !@options[:tag].empty?
+        $0 = title
+      end
+
       def spawn_worker(idx)
         @config.run_hooks(:before_worker_fork, idx, @log_writer, @hook_data)
+
+        pipes = {
+          check_pipe: @check_pipe,
+          worker_write: @worker_write,
+        }
+
+        if @options[:mold_worker]
+          pipes[:fork_pipe] = @fork_pipe
+          pipes[:wakeup] = @wakeup
+        end
 
         pid = fork do
           new_worker = Worker.new index: idx,
                                   master: master,
                                   launcher: @launcher,
-                                  pipes: { check_pipe: @check_pipe,
-                                           worker_write: @worker_write },
+                                  pipes: pipes,
                                   app: @app
           new_worker.run
         end

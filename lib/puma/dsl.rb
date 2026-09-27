@@ -1443,9 +1443,45 @@ module Puma
     #   fork_worker
     #
     def fork_worker(after_requests=1000)
+      return if warn_on_incompatible_option(:mold_worker, :fork_worker)
       @options[:fork_worker] = Integer(after_requests)
     end
 
+    # When enabled, workers will be converted to a "mold" process as needed from which further workers
+    # are forked. This option is similar to fork_worker but the process that does the reforking does
+    # not take any further traffic. This allows the mold process to be optimized for copy-on-write
+    # performance and stability.
+    #
+    # This option also enables the `refork` command (SIGURG), which allows external processes to trigger
+    # promotion and reforking from a new mold process.
+    #
+    # Reforks will trigger automatically as workers hit the specified number of requests (default 1000),
+    # and multiple intervals can be specified (as absolute request count thresholds) to allow for improved
+    # performance over time.
+    def mold_worker(mold_at=1000, *additional_molds)
+      return if warn_on_incompatible_option(:fork_worker, :mold_worker)
+      @options[:mold_worker] = [Integer(mold_at)] + additional_molds.map { |m| Integer(m) }
+    end
+
+    # Code to run when a worker is promoted to a mold process before it starts reforking.
+    # This code can do things like making sure large shareable objects have been initialized
+    # or connections are closed.
+    def on_mold_promotion(key = nil, &block)
+      process_hook :on_mold_promotion, key, block, cluster_only: true
+    end
+
+    # Code to run immediately before a mold process shuts down.
+    def on_mold_shutdown(key = nil, &block)
+      process_hook :on_mold_shutdown, key, block, cluster_only: true
+    end
+
+    # The number of requests to attempt inline before sending a client back to
+    # the reactor to be subject to normal ordering.
+    #
+    # The default is 10.
+    #
+    # @example
+    #   max_fast_inline 20
     # @deprecated Use {#max_keep_alive} instead.
     #
     def max_fast_inline(num_of_requests)
@@ -1632,6 +1668,18 @@ module Puma
         raise "'#{options_key}' key must be String or Symbol"
       end
       @options[options_key] << hook_options
+    end
+
+    def warn_on_incompatible_option(first_option, conflicting_additional_option)
+      return false unless @options[first_option]
+
+      log_string =
+        "Warning: `#{first_option}` has already been set and is incompatible " \
+        "with the `#{conflicting_additional_option}` option, " \
+        "ignoring the `#{conflicting_additional_option}` option for now."
+
+      LogWriter.stdio.log(log_string)
+      true
     end
   end
 end
