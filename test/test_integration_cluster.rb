@@ -46,8 +46,8 @@ class TestIntegrationCluster < TestIntegration
   end
 
   def test_phased_restart_does_not_drop_connections_threads_mold_worker
-    restart_does_not_drop_connections num_threads: 10, total_requests: 3_000,
-      signal: :USR1, config: 'mold_worker'
+    restart_does_not_drop_connections num_threads: 10, signal: :USR1,
+      config: "mold_worker 20; preload_app! false"
   end
 
   def test_phased_restart_does_not_drop_connections_unix
@@ -409,7 +409,87 @@ class TestIntegrationCluster < TestIntegration
 
     socks.each { |s| read_body s }
 
-    refute_includes pids, get_worker_pids(1, wrkrs)
+    assert_empty pids & get_worker_pids(1, wrkrs)
+  end
+
+  def test_mold_worker_promotes_mold_before_stopping_workers
+    wrkrs = 3
+    cli_server "-w #{wrkrs} test/rackup/hello.ru", config: "mold_worker"
+
+    get_worker_pids 0, wrkrs
+    Process.kill :SIGURG, @pid
+
+    line = wait_for_server_to_match(/Promoting worker|Stopping \d+ for/)
+    assert_includes line, "Promoting worker"
+
+    # every worker, including the one promoted to the mold, is replaced
+    get_worker_pids 1, wrkrs
+  end
+
+  def test_mold_worker_burst_does_not_skip_thresholds
+    wrkrs = 2
+    cli_server "-w #{wrkrs} test/rackup/hello.ru", config: <<~CONFIG
+      mold_worker 5, 30
+      worker_check_interval 1
+    CONFIG
+
+    get_worker_pids 0, wrkrs
+
+    # Serve more requests than both thresholds before the next ping. The new mold
+    # reports this count, but only serving workers count towards the next threshold.
+    100.times { read_body connect }
+    get_worker_pids 1, wrkrs
+
+    # a second automatic refork would boot phase 2 workers
+    assert_raises(Minitest::Assertion) { get_worker_pids 2, 1, timeout: 4 }
+  end
+
+  def test_mold_worker_phased_restart_loads_new_code
+    dir = Dir.mktmpdir
+    version = File.join dir, "version"
+    rackup = File.join dir, "config.ru"
+    File.write version, "v1"
+    File.write rackup, <<~RUBY
+      loaded = File.read(#{version.inspect})
+      run ->(env) { [200, {}, [loaded]] }
+    RUBY
+
+    wrkrs = 2
+    cli_server "-w #{wrkrs} #{rackup}", config: <<~CONFIG
+      mold_worker
+      preload_app! false
+    CONFIG
+
+    get_worker_pids 0, wrkrs
+    Process.kill :SIGURG, @pid
+    get_worker_pids 1, wrkrs
+
+    File.write version, "v2"
+    Process.kill :SIGUSR1, @pid
+    wait_for_server_to_include "Starting phased worker restart, phase: 2"
+    get_worker_pids 2, wrkrs
+
+    bodies = Array.new(10) { read_body connect }
+    assert_equal ["v2"], bodies.uniq
+  ensure
+    FileUtils.rm_rf dir if dir
+  end
+
+  def test_mold_worker_runs_on_mold_shutdown
+    wrkrs = 2
+    cli_server "-w #{wrkrs} test/rackup/hello.ru", merge_err: true, config: <<~CONFIG
+      mold_worker
+      on_mold_shutdown { STDOUT.syswrite "on_mold_shutdown called\n" }
+    CONFIG
+
+    get_worker_pids 0, wrkrs
+    Process.kill :SIGURG, @pid
+    get_worker_pids 1, wrkrs
+
+    stop_server
+    output = @server_log + @server_line_buffer
+    assert_includes output, "on_mold_shutdown called"
+    refute_match(/Error/, output)
   end
 
   # use three workers to keep accepting clients
