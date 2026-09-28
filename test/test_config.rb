@@ -17,6 +17,22 @@ class TestConfigFile < PumaTest
     assert_equal max_threads, conf.options.default_options[:max_threads]
   end
 
+  def test_mold_worker_candidates
+    ready = -> { true }
+    conf = Puma::Configuration.new do |c|
+      c.mold_worker 100, 200
+      c.mold_worker_candidates 2, ready_timeout: 60
+      c.mold_ready?(&ready)
+      c.before_mold_candidate_boot { }
+    end
+    conf.clamp
+
+    assert_equal [100, 200], conf.options[:mold_worker]
+    assert_equal({ count: 2, ready_timeout: 60.0, fallback_factor: 3.0 }, conf.options[:mold_worker_candidates])
+    assert_same ready, conf.options[:mold_ready]
+    assert_equal 1, conf.options[:before_mold_candidate_boot].size
+  end
+
   def test_app_from_rackup
     if Rack.release >= '3'
       fn = "test/rackup/hello-bind_rack3.ru"

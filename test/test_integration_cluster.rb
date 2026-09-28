@@ -475,6 +475,61 @@ class TestIntegrationCluster < TestIntegration
     FileUtils.rm_rf dir if dir
   end
 
+  def test_mold_worker_candidates_promotes_candidate_after_ready_timeout
+    wrkrs = 3
+    cli_server "-w #{wrkrs} test/rackup/hello.ru", config: <<~CONFIG
+      mold_worker 5
+      mold_worker_candidates 1, ready_timeout: 2
+      worker_check_interval 1
+      before_mold_candidate_boot { |index| STDOUT.syswrite "candidate boot \#{index}\n" }
+      mold_ready? { false }
+    CONFIG
+
+    assert_includes wait_for_server_to_match(/candidate boot \d/), "candidate boot 0"
+    get_worker_pids 0, wrkrs
+
+    30.times { read_body connect }
+
+    # worker 0 is never ready, so it is promoted when ready_timeout has passed
+    assert_includes wait_for_server_to_match(/Promoting worker \d+/), "Promoting worker 0 "
+    get_worker_pids 1, wrkrs
+    refute_includes @server_log, "candidate boot 1"
+    refute_includes @server_log, "candidate boot 2"
+  end
+
+  def test_mold_worker_candidates_compile_with_yjit_in_candidate_only
+    skip "requires YJIT" unless defined?(RubyVM::YJIT) && RubyVM::YJIT.respond_to?(:enable)
+    skip "YJIT is already enabled for every process" if RubyVM::YJIT.enabled? || ENV["RUBY_YJIT_ENABLE"]
+
+    dir = Dir.mktmpdir
+    rackup = File.join dir, "config.ru"
+    File.write rackup, <<~RUBY
+      run ->(env) { [200, {}, [RubyVM::YJIT.enabled?.to_s]] }
+    RUBY
+
+    wrkrs = 3
+    cli_server "-w #{wrkrs} #{rackup}", config: <<~CONFIG
+      mold_worker
+      mold_worker_candidates 1
+      worker_check_interval 1
+      before_mold_candidate_boot { RubyVM::YJIT.enable(call_threshold: 1) unless RubyVM::YJIT.enabled? }
+      mold_ready? { RubyVM::YJIT.runtime_stats(:compiled_iseq_count) > 0 }
+    CONFIG
+
+    get_worker_pids 0, wrkrs
+
+    # only worker 0 compiles, so some responses come from workers without YJIT
+    assert_includes Array.new(20) { read_body connect }, "false"
+
+    Process.kill :SIGURG, @pid
+    assert_includes wait_for_server_to_match(/Promoting worker \d+/), "Promoting worker 0 "
+
+    get_worker_pids 1, wrkrs
+    assert_equal ["true"], Array.new(10) { read_body connect }.uniq
+  ensure
+    FileUtils.rm_rf dir if dir
+  end
+
   def test_mold_worker_runs_on_mold_shutdown
     wrkrs = 2
     cli_server "-w #{wrkrs} test/rackup/hello.ru", merge_err: true, config: <<~CONFIG

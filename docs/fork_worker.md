@@ -60,6 +60,44 @@ Where available from the OS (Linux 3.4+), if you are using `fork_worker` or `mol
 - Puma forks workers directly from the cluster parent at boot. If a worker exits before any mold exists, the worker with the highest request count is promoted to mold and the replacement is forked from it.
 - A mold does not serve requests, so it does not warm up further. To fork from a more warmed-up process later, add another threshold or send SIGURG.
 
+### Mold candidates
+
+By default any worker can be promoted to mold. `mold_worker_candidates N` limits promotion to the workers with an index below `N`. A worker that replaces a candidate has the same index, so it is also a candidate. Two settings go with it:
+
+- `before_mold_candidate_boot` runs in each candidate when it boots, after `before_worker_boot`. Use it to prepare only the candidates.
+- `mold_ready?` is a block that each candidate calls every `worker_check_interval` and reports in its status. A candidate is promoted only when the block last returned true.
+
+An automatic refork is due when a candidate has served the current threshold. So that a candidate that receives little traffic cannot block reforks, a refork is also due when the other workers have served on average `fallback_factor` (default 3) times the threshold. If no eligible candidate is ready, Puma waits up to `ready_timeout` seconds (default 300) and then promotes the candidate with the most requests.
+
+#### Compile with YJIT in candidates only
+
+With this configuration only worker 0 compiles code with YJIT. The other workers run without YJIT until the first refork, and then inherit the mold's compiled code, which they share with the mold until they compile code of their own.
+
+```ruby
+mold_worker 2000, 6000
+mold_worker_candidates 1, ready_timeout: 600
+
+before_fork do
+  # YJIT cannot be turned off, so if the master has it, every worker compiles
+  raise "YJIT is enabled in the master process" if defined?(RubyVM::YJIT) && RubyVM::YJIT.enabled?
+end
+
+before_mold_candidate_boot do
+  RubyVM::YJIT.enable unless RubyVM::YJIT.enabled?
+end
+
+# ready when the number of compiled methods grew by less than 1% since the last report
+previous = 0
+mold_ready? do
+  count = RubyVM::YJIT.enabled? ? RubyVM::YJIT.runtime_stats(:compiled_iseq_count) : 0
+  ready = count > 0 && count - previous <= previous / 100
+  previous = count
+  ready
+end
+```
+
+Start Ruby without `--yjit` and with `RUBY_YJIT_ENABLE=0`. With `preload_app!`, Rails enables YJIT in the master from its `config.yjit` initializer, so set `config.yjit = false`. `RubyVM::YJIT.enable` requires Ruby 3.3 or later.
+
 ### Mold-Worker Migration Guide (From Fork-Worker)
 
 - Move logic in your `before_refork` hook that shuts down worker resources to the `on_mold_promotion` hook. Remove any other logic, or move it to a `before_worker_boot` hook.

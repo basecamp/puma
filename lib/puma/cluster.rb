@@ -6,6 +6,7 @@ require_relative 'plugin'
 require_relative 'cluster/worker_handle'
 require_relative 'cluster/worker'
 require_relative 'cluster/pipe_protocols'
+require_relative 'cluster/mold_candidates'
 
 module Puma
   # This class is instantiated by the `Puma::Launcher` and used
@@ -28,6 +29,7 @@ module Puma
       @mold = nil
       @mold_candidate = nil
       @mold_interval_index = 0
+      @mold_candidates = MoldCandidates.from_options(@options) if @options[:mold_worker]
     end
 
     # Returns the list of cluster worker handles.
@@ -341,6 +343,7 @@ module Puma
       return false if @pending_phased_restart == :restart
 
       @mold_candidate = mold_candidate
+      @mold_candidates&.reset
       phased_restart(true)
     end
 
@@ -371,9 +374,18 @@ module Puma
           next if @pending_phased_restart || !@workers.include?(w) || !all_workers_in_phase?
 
           next_request_interval = @options[:mold_worker][@mold_interval_index]
-          next unless next_request_interval && w.last_status[:requests_count].to_i >= next_request_interval
+          next unless next_request_interval
+
+          mold_candidate =
+            if @mold_candidates
+              @mold_candidates.due(@workers, next_request_interval)
+            elsif w.last_status[:requests_count].to_i >= next_request_interval
+              w
+            end
+          next unless mold_candidate
+
           @mold_interval_index += 1
-          mold_and_refork!(w)
+          mold_and_refork!(mold_candidate)
         end
       end
 
@@ -711,9 +723,7 @@ module Puma
         return if @mold || @workers.size >= @options[:workers]
       end
 
-      # pick the booted worker with the highest request count in the current phase
-      mold_candidate ||= most_experienced_worker(@workers.select { |w| w.booted? && w.phase == @phase })
-      mold_candidate ||= most_experienced_worker(@workers.select(&:booted?))
+      mold_candidate ||= best_mold_candidate
       return if mold_candidate.nil? || !mold_candidate.booted?
 
       log "- Promoting worker #{mold_candidate.index} (PID: #{mold_candidate.pid}) to mold after #{mold_candidate.last_status[:requests_count].to_i} requests, phase: #{@phase}"
@@ -758,11 +768,23 @@ module Puma
     rescue Errno::ESRCH, Errno::EPERM
     end
 
+    # Returns the booted worker to promote, preferring workers in the current phase. With
+    # mold_worker_candidates, only candidates are considered, and ready ones first.
+    def best_mold_candidate
+      in_phase = @workers.select { |w| w.phase == @phase }
+      if @mold_candidates
+        @mold_candidates.pick(in_phase) || @mold_candidates.pick(@workers)
+      else
+        most_experienced_worker(in_phase.select(&:booted?)) || most_experienced_worker(@workers.select(&:booted?))
+      end
+    end
+
     def retire_mold
       retire(@mold)
       @mold = nil
       @mold_candidate = nil
       @mold_interval_index = 0
+      @mold_candidates&.reset
     end
 
     def retire(mold)

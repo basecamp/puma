@@ -1472,6 +1472,66 @@ module Puma
       @options[:mold_worker] = [Integer(mold_at)] + additional_molds.map { |m| Integer(m) }
     end
 
+    # Limits which workers can be promoted to a mold to the workers with an index below
+    # +count+. Requires +mold_worker+. Combine it with +before_mold_candidate_boot+, to
+    # prepare only the candidates (for example, to compile code with YJIT in them only),
+    # and with +mold_ready?+, to promote a candidate only once it is ready.
+    #
+    # An automatic refork is due when a candidate has served the current +mold_worker+
+    # threshold. So that a candidate that receives little traffic cannot block reforks,
+    # a refork is also due when the other workers have served on average +fallback_factor+
+    # times the threshold. In that case the candidate with the most requests is promoted.
+    #
+    # If no eligible candidate is ready, promotion waits up to +ready_timeout+ seconds
+    # (default 300) and then goes ahead with the candidate with the most requests. The
+    # default +fallback_factor+ is 3.
+    #
+    # @note This is experimental.
+    # @note Cluster mode only.
+    #
+    # @example Compile code with YJIT only in worker 0, and promote it once compilation slows down
+    #   mold_worker 2000, 6000
+    #   mold_worker_candidates 1, ready_timeout: 600
+    #
+    #   before_mold_candidate_boot do
+    #     RubyVM::YJIT.enable unless RubyVM::YJIT.enabled?
+    #   end
+    #
+    #   previous = 0
+    #   mold_ready? do
+    #     count = RubyVM::YJIT.enabled? ? RubyVM::YJIT.runtime_stats(:compiled_iseq_count) : 0
+    #     ready = count > 0 && count - previous <= previous / 100
+    #     previous = count
+    #     ready
+    #   end
+    #
+    def mold_worker_candidates(count, ready_timeout: 300, fallback_factor: 3)
+      @options[:mold_worker_candidates] = {
+        count: Integer(count),
+        ready_timeout: Float(ready_timeout),
+        fallback_factor: Float(fallback_factor),
+      }
+    end
+
+    # Code to run in each mold candidate (see +mold_worker_candidates+) when it boots,
+    # after the +before_worker_boot+ hooks. Workers forked from a mold also run it.
+    #
+    # @note Cluster mode only.
+    def before_mold_candidate_boot(key = nil, &block)
+      process_hook :before_mold_candidate_boot, key, block, cluster_only: true
+    end
+
+    # A block that reports whether a mold candidate is ready to be promoted. Each
+    # candidate calls the block in a background thread every +worker_check_interval+
+    # and sends the result to the master in its status. The block cannot take arguments,
+    # and an exception counts as not ready.
+    #
+    # @note Cluster mode only.
+    def mold_ready?(&block)
+      raise ArgumentError, "mold_ready? requires a block" unless block
+      @options[:mold_ready] = block
+    end
+
     # Code to run when a worker is promoted to a mold process before it starts reforking.
     # This code can do things like making sure large shareable objects have been initialized
     # or connections are closed.

@@ -57,6 +57,7 @@ module Puma
         # Invoke any worker boot hooks so they can get
         # things in shape before booting the app.
         @config.run_hooks(:before_worker_boot, index, @log_writer, @hook_data)
+        @config.run_hooks(:before_mold_candidate_boot, index, @log_writer, @hook_data) if mold_candidate?
 
         begin
           @server = start_server
@@ -214,6 +215,7 @@ module Puma
               payload = base_payload.dup
 
               hsh = @server.stats
+              hsh[:mold_ready] = mold_ready? ? 1 : 0 if @options[:mold_ready] && mold_candidate? && !@mold
               hsh.each do |k, v|
                 payload << %Q! "#{k}":#{v || 0},!
               end
@@ -227,6 +229,21 @@ module Puma
           end
         end
 
+      end
+
+      # True when mold_worker_candidates allows this worker to be promoted to a mold.
+      def mold_candidate?
+        candidates = @options[:mold_worker_candidates]
+        @options[:mold_worker] && candidates && index < candidates[:count]
+      end
+
+      def mold_ready?
+        @options[:mold_ready].call ? true : false
+      rescue StandardError => e
+        # the block runs on every status report, so only log the first error
+        log "! mold_ready? raised #{e.class}: #{e.message}" unless @mold_ready_error_logged
+        @mold_ready_error_logged = true
+        false
       end
 
       def set_proc_title(role: "worker")
