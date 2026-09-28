@@ -479,7 +479,8 @@ class TestIntegrationCluster < TestIntegration
     wrkrs = 2
     cli_server "-w #{wrkrs} test/rackup/hello.ru", merge_err: true, config: <<~CONFIG
       mold_worker
-      on_mold_shutdown { STDOUT.syswrite "on_mold_shutdown called\n" }
+      # the delay checks that the master waits for the mold to finish its hook
+      on_mold_shutdown { sleep 1; STDOUT.syswrite "on_mold_shutdown called\n" }
     CONFIG
 
     get_worker_pids 0, wrkrs

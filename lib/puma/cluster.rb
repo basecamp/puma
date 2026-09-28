@@ -42,7 +42,8 @@ module Puma
       begin
         loop do
           wait_workers
-          break if @workers.reject {|w| w.pid.nil?}.empty?
+          # also wait for molds, so that their on_mold_shutdown hooks can finish
+          break if @workers.reject {|w| w.pid.nil?}.empty? && @tracked_molds.empty?
           sleep 0.2
         end
       rescue Interrupt
@@ -195,6 +196,7 @@ module Puma
       timeout_workers
       wait_workers
       cull_workers
+      discard_unforked_workers if @options[:mold_worker]
       promote_mold(in_phased_restart) if @options[:mold_worker]
       spawn_workers
 
@@ -540,7 +542,7 @@ module Puma
               if req == PIPE_BOOT || req == PIPE_FORK
                 pid, idx = result.split(':').map(&:to_i)
                 w = worker_at idx
-                w.pid = pid if w.pid.nil?
+                w.pid = pid if w && w.pid.nil?
               end
 
               if w = @tracked_molds.find { |x| x.pid == pid } || @workers.find { |x| x.pid == pid }
@@ -579,6 +581,7 @@ module Puma
                 end
               else
                 log "! Out-of-sync worker list, no #{pid} worker"
+                stop_untracked_worker(pid) if @options[:mold_worker] && (req == PIPE_BOOT || req == PIPE_FORK)
               end
             end
 
@@ -731,6 +734,28 @@ module Puma
       Puma.enable_child_subreaper
     rescue SystemCallError => e
       log "! Unable to enable child subreaper: #{e.message}"
+    end
+
+    # A mold serves the fork requests in the pipe. If no mold process is left, for example
+    # because a phased restart retired it or it crashed, remove the remaining requests and
+    # the handles that wait for them, so that those workers are replaced.
+    def discard_unforked_workers
+      return unless @tracked_molds.empty?
+
+      unforked = @workers.select { |w| w.pid.nil? }
+      return if unforked.empty?
+
+      nil while PipeProtocols::Fork.read_nonblock_from(@fork_pipe).is_a?(Integer)
+      @workers -= unforked
+      log "- Replacing #{unforked.size} worker(s) that no mold forked"
+    end
+
+    # A worker the master does not track, for example one forked by a mold from a request
+    # that was already discarded, is stopped so that it does not serve requests.
+    def stop_untracked_worker(pid)
+      log "- Stopping untracked worker (PID: #{pid})"
+      Process.kill :TERM, pid
+    rescue Errno::ESRCH, Errno::EPERM
     end
 
     def retire_mold
