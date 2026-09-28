@@ -512,8 +512,8 @@ class TestIntegrationCluster < TestIntegration
       mold_worker
       mold_worker_candidates 1
       worker_check_interval 1
-      before_mold_candidate_boot { RubyVM::YJIT.enable(call_threshold: 1) unless RubyVM::YJIT.enabled? }
-      mold_ready? { RubyVM::YJIT.runtime_stats(:compiled_iseq_count) > 0 }
+      before_mold_candidate_boot { RubyVM::YJIT.enable unless RubyVM::YJIT.enabled? }
+      mold_ready? { RubyVM::YJIT.enabled? && RubyVM::YJIT.runtime_stats(:compiled_iseq_count) > 0 }
     CONFIG
 
     get_worker_pids 0, wrkrs
@@ -526,6 +526,7 @@ class TestIntegrationCluster < TestIntegration
 
     get_worker_pids 1, wrkrs
     assert_equal ["true"], Array.new(10) { read_body connect }.uniq
+    refute_includes @server_log, "mold_ready? raised"
   ensure
     FileUtils.rm_rf dir if dir
   end

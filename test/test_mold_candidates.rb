@@ -48,6 +48,15 @@ class TestMoldCandidates < PumaTest
     assert_same w1, c.due([w0, w1, worker(2, 300), worker(3, 300)], 100, now: 0)
   end
 
+  def test_fallback_on_large_cluster_waits_for_average
+    c = candidates
+    w0 = worker(0, 1000)
+    # 62 other workers at about 97 requests each have served 3 times the threshold between them
+    assert_nil c.due([w0, *Array.new(62) { |i| worker(i + 1, 97) }], 2000, now: 0)
+    assert_nil c.due([w0, *Array.new(62) { |i| worker(i + 1, 5999) }], 2000, now: 0)
+    assert_same w0, c.due([w0, *Array.new(62) { |i| worker(i + 1, 6000) }], 2000, now: 0)
+  end
+
   def test_fallback_does_not_depend_on_number_of_workers
     c = candidates
     # 7 other workers served 3 times the threshold between them, but each served less than the threshold
